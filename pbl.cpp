@@ -1,6 +1,7 @@
 #include <iostream>
 #include <fstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <string>
 #include <set>
@@ -12,601 +13,465 @@
 #include <filesystem>
 #include <algorithm>
 #include <iomanip>
+#include <functional>
 
 using namespace std;
 
-// ========================= GLOBAL STRUCTURES ========================= //
-
-// Struct representing a single commit object
 struct Commit {
     string id, branch, message, timestamp;
     vector<string> files;
-    unordered_map<string, string> fileChanges;
+    unordered_map<string, string> fileChanges; // filename -> file hash
 };
 
-// Core data containers
+vector<Commit> history;
+unordered_map<string, string> fileHashes; // filename -> hash
+map<string, vector<string>> commitGraph; // parent -> children
+set<string> branches = {"main"};
+unordered_map<string, string> users; // username -> password
+vector<Commit> remoteRepo;
 
-// Vector to store the commit history
-vector<Commit> history; 
+string currentBranch = "main";
+string currentUser  = "";
+const string vcsDir = ".vcs";
 
-// map to store the content of hashes                       
-unordered_map<string, string> fileHashes;
-
-// DAG(Directed Acyclic Graph) of commit relationships user made     
-map<string, vector<string>> commitGraph; 
-
-// A vector of String type to store Branch names      
-set<string> branches = {"main"}; 
-
-// Map to check the Registered users              
-unordered_map<string, string> users; 
-
-// Active Branch in which we are working          
-string currentBranch = "main";  
-
-// Currently logged-in user               
-string currentUser = "";         
-
-// Simulated remote repo store             
-vector<Commit> remoteRepo;                     
-
-// Console color helpers
 const string colorReset = "\033[0m";
 const string colorGreen = "\033[32m";
 const string colorYellow = "\033[33m";
 const string colorRed = "\033[31m";
 
-
-// ========================= UTILITY FUNCTIONS ========================= //
-
-// Generate hash from file content
 string hashFile(const string &path) {
     ifstream file(path);
+    if (!file) return "";
     stringstream buffer;
     buffer << file.rdbuf();
     hash<string> hasher;
     return to_string(hasher(buffer.str()));
 }
 
-// Generate current timestamp string
 string currentTimestamp() {
     auto now = chrono::system_clock::now();
     time_t now_c = chrono::system_clock::to_time_t(now);
-    return string(ctime(&now_c));
+    string ts = string(ctime(&now_c));
+    if (!ts.empty() && ts.back() == '\n') ts.pop_back();
+    return ts;
 }
 
-// Save current file hashes to persistent storage
 void saveHashes() {
-    ofstream out(".vcs/hashes.txt");
+    filesystem::create_directory(vcsDir);
+    ofstream out(vcsDir + "/hashes.txt");
     for (const auto &pair : fileHashes) {
         out << pair.first << " " << pair.second << "\n";
     }
 }
 
-// Load saved hashes into memory
 void loadHashes() {
-    ifstream in(".vcs/hashes.txt");
+    ifstream in(vcsDir + "/hashes.txt");
+    if (!in) return;
     string file, hash;
     while (in >> file >> hash) {
         fileHashes[file] = hash;
     }
 }
 
-// Append user/system activity to log
 void logEvent(const string &event) {
-    ofstream log(".vcs/events.log", ios::app);
+    filesystem::create_directory(vcsDir);
+    ofstream log(vcsDir + "/events.log", ios::app);
     log << currentTimestamp() << ": " << event << "\n";
 }
 
+bool detectCycleUtil(const string &node, unordered_set<string> &visited, unordered_set<string> &recStack) {
+    visited.insert(node);
+    recStack.insert(node);
 
-// ========================= AUTHENTICATION MODULE ========================= //
-
-// Register a new user
-void registerUser(const string &username, const string &password) {
-    if (users.count(username)) {
-        cout << colorRed << "[ERROR] User already exists.\n" << colorReset;
-        logEvent("Failed registration for '" + username + "'");
-        return;
+    auto it = commitGraph.find(node);
+    if (it != commitGraph.end()) {
+        for (const auto &neighbor : it->second) {
+            if (recStack.count(neighbor)) return true;
+            if (!visited.count(neighbor)) {
+                if (detectCycleUtil(neighbor, visited, recStack)) return true;
+            }
+        }
     }
-    users[username] = password;
-    cout << colorGreen << "[SUCCESS] Registered '" << username << "'.\n" << colorReset;
-    logEvent("Registered user '" + username + "'");
+    recStack.erase(node);
+    return false;
 }
 
-// Authenticate and login user
-void loginUser(const string &username, const string &password) {
-    if (users.count(username) && users[username] == password) {
-        currentUser = username;
-        cout << colorGreen << "[SUCCESS] Logged in as '" << username << "'.\n" << colorReset;
-        logEvent("Logged in user '" + username + "'");
+bool detectCycle() {
+    unordered_set<string> visited;
+    unordered_set<string> recStack;
+
+    for (const auto &pair : commitGraph) {
+        if (!visited.count(pair.first)) {
+            if (detectCycleUtil(pair.first, visited, recStack)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+unordered_map<string, vector<string>> reverseGraph() {
+    unordered_map<string, vector<string>> reversed;
+    for (const auto &pair : commitGraph) {
+        for (const auto &child : pair.second) {
+            reversed[child].push_back(pair.first);
+        }
+    }
+    return reversed;
+}
+
+vector<string> topologicalSort() {
+    unordered_set<string> visited;
+    stack<string> Stack;
+    vector<string> sortedCommits;
+
+    unordered_set<string> allCommits;
+    for (const auto &commit : history) allCommits.insert(commit.id);
+    for (const auto &pair : commitGraph) {
+        allCommits.insert(pair.first);
+        for (const auto &child : pair.second) allCommits.insert(child);
+    }
+
+    auto reversed = reverseGraph();
+
+    function<void(const string &)> dfs = [&](const string &node) {
+        visited.insert(node);
+        for (const auto &neighbor : reversed[node]) {
+            if (!visited.count(neighbor)) dfs(neighbor);
+        }
+        Stack.push(node);
+    };
+
+    for (const auto &commitId : allCommits) {
+        if (!visited.count(commitId)) dfs(commitId);
+    }
+
+    while (!Stack.empty()) {
+        sortedCommits.push_back(Stack.top());
+        Stack.pop();
+    }
+    return sortedCommits;
+}
+
+void initRepo() {
+    if (!filesystem::exists(vcsDir)) {
+        filesystem::create_directory(vcsDir);
+        cout << colorGreen << "Repository initialized.\n" << colorReset;
+        logEvent("Repository initialized");
     } else {
-        cout << colorRed << "[ERROR] Invalid credentials.\n" << colorReset;
-        logEvent("Failed login for '" + username + "'");
+        cout << colorYellow << "Repository already exists.\n" << colorReset;
     }
 }
 
-// Log out the currently active user
-void logoutUser() {
-    if (currentUser.empty()) {
-        cout << colorYellow << "[WARN] No user is currently logged in.\n" << colorReset;
+void createBranch(const string &branchName) {
+    if (branches.count(branchName)) {
+        cout << colorYellow << "Branch '" << branchName << "' already exists.\n" << colorReset;
+    } else {
+        branches.insert(branchName);
+        cout << colorGreen << "Branch '" << branchName << "' created.\n" << colorReset;
+        logEvent("Branch created: " + branchName);
+    }
+}
+
+void switchBranch(const string &branchName) {
+    if (branches.count(branchName)) {
+        currentBranch = branchName;
+        cout << colorGreen << "Switched to branch '" << branchName << "'.\n" << colorReset;
+        logEvent("Switched to branch: " + branchName);
+    } else {
+        cout << colorRed << "Branch '" << branchName << "' does not exist.\n" << colorReset;
+    }
+}
+
+void createCommit(const string &message) {
+    if (currentUser .empty()) {
+        cout << colorRed << "You must be logged in to commit.\n" << colorReset;
         return;
     }
-    logEvent("Logged out user '" + currentUser + "'");
-    currentUser.clear();
-    cout << colorGreen << "[SUCCESS] Logout successful.\n" << colorReset;
-}
-// ==============================
-// VIEW COMMIT HISTORY MODULE
-// ==============================
 
-// Show the commit history of the current branch
+    vector<string> files;
+    unordered_map<string, string> changes;
+
+    for (const auto &entry : filesystem::directory_iterator(".")) {
+        if (entry.is_regular_file()) {
+            string filename = entry.path().filename().string();
+            if (filename == vcsDir) continue;
+            string h = hashFile(filename);
+            files.push_back(filename);
+            changes[filename] = h;
+            fileHashes[filename] = h;
+        }
+    }
+    saveHashes();
+
+    Commit c;
+    c.id = "c" + to_string(history.size() + 1);
+    c.branch = currentBranch;
+    c.message = message;
+    c.timestamp = currentTimestamp();
+    c.files = files;
+    c.fileChanges = changes;
+
+    history.push_back(c);
+
+    string prevCommitId;
+    for (auto it = history.rbegin(); it != history.rend(); ++it) {
+        if (it->branch == currentBranch && it->id != c.id) {
+            prevCommitId = it->id;
+            break;
+        }
+    }
+    if (!prevCommitId.empty()) {
+        commitGraph[prevCommitId].push_back(c.id);
+    }
+
+    cout << colorGreen << "Commit '" << c.id << "' created on branch '" << currentBranch << "'.\n" << colorReset;
+    logEvent("Commit created: " + c.id + " on branch " + currentBranch);
+}
+
 void viewLog() {
     cout << colorYellow << "Commit History for branch '" << currentBranch << "':\n" << colorReset;
-    for (const auto &commit : history) {
-        if (commit.branch == currentBranch) {
+    vector<string> sortedCommits = topologicalSort();
+
+    unordered_map<string, Commit> commitMap;
+    for (const auto &c : history) {
+        commitMap[c.id] = c;
+    }
+
+    for (const auto &commitId : sortedCommits) {
+        if (commitMap.count(commitId) && commitMap[commitId].branch == currentBranch) {
+            const auto &commit = commitMap[commitId];
             cout << colorGreen << "Commit ID: " << commit.id << "\n" << colorReset;
             cout << "Message   : " << commit.message << "\n";
-            cout << "Timestamp : " << commit.timestamp;
+            cout << "Timestamp : " << commit.timestamp << "\n";
             cout << "Files     : ";
-            for (const auto &file : commit.files) {
-                cout << file << " ";
-            }
+            for (const auto &file : commit.files) cout << file << " ";
             cout << "\n\n";
         }
     }
 }
 
+void mergeBranches(const string &sourceBranch) {
+    cout << "Starting merge from '" << sourceBranch << "' into '" << currentBranch << "'...\n";
 
-// FILE DIFFERENCING MODULE
-
-// This function is two show diiferences between two snapshots
-void showDiff(const string &filename) {
-    string snapshotPath = ".vcs/snapshots/" + filename;
-
-    ifstream currentFile(filename);
-    ifstream snapshotFile(snapshotPath);
-
-    if (!currentFile || !snapshotFile) 
-    {
-        cout << colorRed << "Error: File not found in current or snapshot.\n" << colorReset;
+    if (!branches.count(sourceBranch)) {
+        cout << colorRed << "Source branch does not exist.\n" << colorReset;
         return;
     }
 
-    cout << colorYellow << "Diff for file: " << filename << "\n" << colorReset;
-
-    string currentLine, snapshotLine;
-    int lineNum = 1;
-
-    while (getline(currentFile, currentLine) && getline(snapshotFile, snapshotLine)) 
-    {
-        if (currentLine != snapshotLine) {
-            cout << colorRed << "- " << lineNum << ": " << snapshotLine << "\n" << colorGreen << "+ " << lineNum << ": " << currentLine << colorReset << "\n";
-        }
-        ++lineNum;
+    string sourceLastCommitId, currentLastCommitId;
+    for (auto it = history.rbegin(); it != history.rend(); ++it) {
+        if (it->branch == sourceBranch && sourceLastCommitId.empty()) sourceLastCommitId = it->id;
+        if (it->branch == currentBranch && currentLastCommitId.empty()) currentLastCommitId = it->id;
+        if (!sourceLastCommitId.empty() && !currentLastCommitId.empty()) break;
     }
 
-    while (getline(snapshotFile, snapshotLine)) 
-    {
-        cout << colorRed << "- " << lineNum << ": " << snapshotLine << colorReset << "\n";
-        ++lineNum;
-    }
-
-    while (getline(currentFile, currentLine)) 
-    {
-        cout << colorGreen << "+ " << lineNum << ": " << currentLine << colorReset << "\n";
-        ++lineNum;
-    }
-}
-
-// ==============================
-// REVERT MODULE
-// ==============================
-
-// Revert a specific file to the last committed version
-void revertFile(const string &filename) 
-{
-    string snapshotPath = ".vcs/snapshots/" + filename;
-
-    if (!filesystem::exists(snapshotPath)) 
-    {
-        cout << colorRed << "Error: Snapshot of file not found.\n" << colorReset;
+    if (sourceLastCommitId.empty() || currentLastCommitId.empty()) {
+        cout << colorYellow << "No commits found on one or both branches. Merge aborted.\n" << colorReset;
         return;
     }
 
-    filesystem::copy(snapshotPath, filename, filesystem::copy_options::overwrite_existing);
-    cout << colorGreen << "File '" << filename << "' reverted to last committed state.\n" << colorReset;
-    logEvent("File '" + filename + "' reverted to snapshot");
-}
+    commitGraph[currentLastCommitId].push_back(sourceLastCommitId);
 
-// === MISSING FUNCTION DEFINITIONS ===
-
-void initRepo() 
-{
-    if (!filesystem::exists(".myvcs")) 
-    {
-        filesystem::create_directory(".myvcs");
-        filesystem::create_directory(".myvcs/commits");
-        filesystem::create_directory(".myvcs/branches");
-        ofstream headFile(".myvcs/HEAD");
-        headFile << "master";
-        headFile.close();
-        ofstream masterFile(".myvcs/branches/master");
-        masterFile << "";
-        masterFile.close();
-        cout << "Repository initialized successfully.\n";
-    } 
-    else 
-    {
-        cout << "Repository already exists.\n";
-    }
-}
-
-
-void createBranch(const string &branchName) 
-{
-    string path = ".myvcs/branches/" + branchName;
-    if (!filesystem::exists(path)) 
-    {
-        ofstream branchFile(path);
-        ifstream head(".myvcs/HEAD");
-        string currentBranch;
-        getline(head, currentBranch);
-        head.close();
-
-        ifstream current(".myvcs/branches/" + currentBranch);
-        string commitHash;
-        getline(current, commitHash);
-        branchFile << commitHash;
-        branchFile.close();
-        cout << "Branch '" << branchName << "' created.\n";
-    } 
-    else 
-    {
-        cout << "Branch '" << branchName << "' already exists.\n";
-    }
-}
-
-
-void switchBranch(const string &branchName) 
-{
-    string path = ".myvcs/branches/" + branchName;
-    if (filesystem::exists(path)) {
-        ofstream head(".myvcs/HEAD");
-        head << branchName;
-        head.close();
-        cout << "Switched to branch '" << branchName << "'.\n";
-    } 
-    else 
-    {
-        cout << "Branch '" << branchName << "' does not exist.\n";
-    }
-}
-
-
-void detectConflicts(const string &sourceBranch) 
-{
-    cout << "Detecting conflicts with branch '" << sourceBranch << "'...\n";
-    if (sourceBranch == "feature" || sourceBranch == "dev") {
-        cout << "Conflicts detected in file 'main.cpp'. Manual resolution needed.\n";
-    } 
-    else 
-    {
-        cout << "No conflicts detected.\n";
-    }
-}
-
-void cleanupRepository() 
-{
-    if (filesystem::exists(".myvcs")) {
-        filesystem::remove_all(".myvcs");
-        cout << "Repository cleaned up.\n";
-    } 
-    else 
-    {
-        cout << "No repository found.\n";
-    }
-}
-
-
-void displayHelp() 
-{
-    cout << "Supported commands:\n";
-    cout << "  init               - Initialize repository\n";
-    cout << "  register <user>    - Register user\n";
-    cout << "  login <user>       - Login as user\n";
-    cout << "  logout             - Logout current user\n";
-    cout << "  commit -m <msg>    - Commit changes\n";
-    cout << "  branch <name>      - Create new branch\n";
-    cout << "  switch <name>      - Switch branch\n";
-    cout << "  merge <source>     - Merge branch\n";
-    cout << "  detect-conflicts   - Detect merge conflicts\n";
-    cout << "  push               - Push to remote\n";
-    cout << "  pull               - Pull from remote\n";
-    cout << "  cleanup            - Delete repo files\n";
-    cout << "  help               - Show this help\n";
-    cout << "  exit               - Exit the system\n";
-}
-
-string generateHash(const string &input) 
-{
-    hash<string> hasher;
-    size_t hashVal = hasher(input);
-    stringstream ss;
-    ss << hex << hashVal;
-    return ss.str();
-}
-
-void createCommit(const string &message) 
-{
-    vector<string> modifiedFiles;
-    for (const auto &entry : filesystem::directory_iterator(".")) 
-    {
-        if (!entry.is_regular_file()) continue;
-        string filename = entry.path().filename().string();
-       if (filename.substr(0, 4) == ".vcs") continue;
-
-        string hash = hashFile(filename);
-        if (fileHashes[filename] != hash) 
-        {
-            modifiedFiles.push_back(filename);
-            fileHashes[filename] = hash;
-
-            // Save snapshot
-            filesystem::create_directories(".vcs/snapshots");
-            filesystem::copy_file(filename, ".vcs/snapshots/" + filename,
-                                  filesystem::copy_options::overwrite_existing);
-        }
-    }
-
-    if (modifiedFiles.empty()) {
-        cout << colorYellow << "No changes to commit.\n" << colorReset;
+    if (detectCycle()) {
+        cout << colorRed << "Merge aborted due to cycle (conflict).\n" << colorReset;
+        auto &children = commitGraph[currentLastCommitId];
+        children.erase(remove(children.begin(), children.end(), sourceLastCommitId), children.end());
         return;
     }
 
-    string id = generateHash(message + currentTimestamp());
-    string timestamp = currentTimestamp();
-
-    Commit commit = {id, currentBranch, message, timestamp, modifiedFiles};
-    history.push_back(commit);
-
-    // Save commit to history
-    ofstream out(".vcs/commits/" + id + ".txt");
-    out << "Commit: " << id << "\n";
-    out << "Branch: " << currentBranch << "\n";
-    out << "User: " << currentUser << "\n";
-    out << "Timestamp: " << timestamp;
-    out << "Message: " << message << "\n";
-    out << "Files:\n";
-    for (const auto &f : modifiedFiles) out << "- " << f << "\n";
-    out.close();
-
-    // Update graph
-    if (!history.empty()) 
-    {
-        commitGraph[history.back().id].push_back(id);
-    }
-
-    cout << colorGreen << "Commit successful! ID: " << id << "\n" << colorReset;
-    logEvent("Committed with ID: " + id);
-    saveHashes();
+    cout << colorGreen << "Merge successful.\n" << colorReset;
+    logEvent("Merged branch '" + sourceBranch + "' into '" + currentBranch + "'");
 }
 
-
-
-void pushToRemote() 
-{
-    string remotePath = ".remote_vcs";
-
-    // to create a new directory if it doesn't exist
-    if (!filesystem::exists(remotePath)) 
-    {
-        filesystem::create_directory(remotePath);
-        filesystem::create_directory(remotePath + "/commits");
-        filesystem::create_directory(remotePath + "/branches");
+void registerUser (const string &username, const string &password) {
+    if (users.count(username)) {
+        cout << colorYellow << "User  already exists.\n" << colorReset;
+        return;
     }
+    users[username] = password;
+    cout << colorGreen << "User  registered successfully.\n" << colorReset;
+    logEvent("User  registered: " + username);
+}
 
-    // Copy commits
-    for (const auto& entry : filesystem::directory_iterator(".myvcs/commits")) 
-    {
-        filesystem::copy(entry, remotePath + "/commits/" + entry.path().filename().string(),
-                         filesystem::copy_options::overwrite_existing);
+void loginUser (const string &username, const string &password) {
+    if (!users.count(username)) {
+        cout << colorRed << "User  does not exist.\n" << colorReset;
+        return;
     }
-
-    // to Copy the branches
-    for (const auto& entry : filesystem::directory_iterator(".myvcs/branches")) 
-    {
-        filesystem::copy(entry, remotePath + "/branches/" + entry.path().filename().string(),
-                         filesystem::copy_options::overwrite_existing);
+    if (users[username] != password) {
+        cout << colorRed << "Incorrect password.\n" << colorReset;
+        return;
     }
+    currentUser  = username;
+    cout << colorGreen << "Logged in as " << username << ".\n" << colorReset;
+    logEvent("User  logged in: " + username);
+}
 
-    // to Copy the head
-    filesystem::copy_file(".myvcs/HEAD", remotePath + "/HEAD", filesystem::copy_options::overwrite_existing);
+void logoutUser () {
+    if (currentUser .empty()) {
+        cout << colorYellow << "No user is currently logged in.\n" << colorReset;
+        return;
+    }
+    cout << colorGreen << "User  " << currentUser  << " logged out.\n" << colorReset;
+    logEvent("User  logged out: " + currentUser );
+    currentUser .clear();
+}
 
-    cout << "Pushed to remote successfully.\n";
+void pushToRemote() {
+    if (currentUser .empty()) {
+        cout << colorRed << "You must be logged in to push.\n" << colorReset;
+        return;
+    }
+    remoteRepo = history;
+    cout << colorGreen << "Pushed commits to remote.\n" << colorReset;
+    logEvent("Pushed commits to remote by " + currentUser );
 }
 
 void pullFromRemote() {
-    string remotePath = ".remote_vcs";
-
-    if (!filesystem::exists(remotePath)) {
-        cout << "Remote repository not found.\n";
+    if (currentUser .empty()) {
+        cout << colorRed << "You must be logged in to pull.\n" << colorReset;
         return;
     }
-
-    // to Copy commits
-    for (const auto& entry : filesystem::directory_iterator(remotePath + "/commits")) {
-        filesystem::copy(entry, ".myvcs/commits/" + entry.path().filename().string(),
-                         filesystem::copy_options::overwrite_existing);
-    }
-
-    // to Copy the branches
-    for (const auto& entry : filesystem::directory_iterator(remotePath + "/branches")) {
-        filesystem::copy(entry, ".myvcs/branches/" + entry.path().filename().string(),
-                         filesystem::copy_options::overwrite_existing);
-    }
-
-    // to Copy the head
-    filesystem::copy_file(remotePath + "/HEAD", ".myvcs/HEAD", filesystem::copy_options::overwrite_existing);
-
-    cout << "Pulled from remote successfully.\n";
-}
-
-void status() 
-{
-    cout << colorYellow << "Modified files:\n" << colorReset;
-    for (const auto &entry : filesystem::directory_iterator(".")) 
-    {
-        if (!entry.is_regular_file()) continue;
-        string filename = entry.path().filename().string();
-        if (filename.substr(0, 4) == ".vcs") continue;
-
-        string currentHash = hashFile(filename);
-        if (fileHashes[filename] != currentHash) 
-        {
-            cout << colorRed << "- " << filename << "\n" << colorReset;
+    for (const auto &commit : remoteRepo) {
+        if (find_if(history.begin(), history.end(), [&](const Commit &c){ return c.id == commit.id; }) == history.end()) {
+            history.push_back(commit);
         }
     }
+    cout << colorGreen << "Pulled commits from remote.\n" << colorReset;
+    logEvent("Pulled commits from remote by " + currentUser );
 }
 
+void createFile() {
+    string filename;
+    cout << "Enter filename to create: ";
+    cin >> filename;
+    cin.ignore();
 
+    if (filesystem::exists(filename)) {
+        cout << colorYellow << "File already exists.\n" << colorReset;
+        return;
+    }
+    ofstream file(filename);
+    if (!file) {
+        cout << colorRed << "Failed to create file.\n" << colorReset;
+        return;
+    }
+    cout << "Enter file content (end input with a single '.' on a line):\n";
+    string line;
+    while (true) {
+        getline(cin, line);
+        if (line == ".") break;
+        file << line << "\n";
+    }
+    file.close();
+    cout << colorGreen << "File '" << filename << "' created.\n" << colorReset;
+}
 
-// MAIN FUNCTION
-
+void showHelp() {
+    cout << colorYellow
+         << "Available commands:\n"
+         << "  init                 - Initialize repository\n"
+         << "  create-file          - Create a new file\n"
+         << "  commit               - Commit changes\n"
+         << "  branch <name>        - Create a branch\n"
+         << "  switch <name>        - Switch to a branch\n"
+         << "  log                  - Show commit history\n"
+         << "  merge <branch>       - Merge a branch into current\n"
+         << "  register             - Register new user\n"
+         << "  login                - Login user\n"
+         << "  logout               - Logout user\n"
+         << "  push                 - Push commits to remote\n"
+         << "  pull                 - Pull commits from remote\n"
+         << "  help                 - Show this help\n"
+         << "  exit                 - Exit program\n"
+         << colorReset;
+}
 
 int main() {
+    cout << "MiniGit++ Version Control System\n";
+    cout << "Type 'help' for commands.\n";
+
+    loadHashes();
+
     string command;
-
-    cout << colorYellow << "Welcome to MiniGit++ Version Control System\n" << colorReset;
-
     while (true) {
-        cout << "\nCommands: init, register, login, logout, commit, branch, create, switch, merge, detect-conflicts, cleanup, help, exit, log, revert\n> ";
-        cin >> command;
+        cout << colorGreen << currentUser  << "@" << currentBranch << "> " << colorReset;
+        getline(cin, command);
+        if (command.empty()) continue;
 
-        if (command == "exit") break;
+        istringstream iss(command);
+        string cmd;
+        iss >> cmd;
 
-        else if (command == "init") initRepo();
+        if (cmd == "exit") break;
 
-        else if (command == "register") 
-        {
-            string username, password;
-            cout<<"Input Username and password"<<endl;
-            cin >> username >> password;
-            registerUser(username, password);
-        } 
-        
-        else if (command == "login") 
-        {
-            string username, password;
-            cout<<"Input Username and password"<<endl;
-            cin >> username >> password;
-            loginUser(username, password);
-        } 
-        
-        else if (command == "logout") logoutUser();
-
-        else if (command == "branch") {
-            string branchName;
-            cout<<"Input Branch Name"<<endl;
-            cin >> branchName;
-            createBranch(branchName);
-        }
-
-        else if (command == "create") {
-            string filename;
-            cout << "Enter filename to create: ";
-            cin >> filename;
-            ofstream file(filename);
-            if (file.is_open()) {
-                cout << "Enter content (end with a single '.' on a new line):\n";
-                string line;
-                while (getline(cin >> ws, line) && line != ".") {
-                    file << line << "\n";
-                }
-                file.close();
-                cout << colorGreen << "File '" << filename << "' created successfully.\n" << colorReset;
-            } else {
-                cout << colorRed << "Failed to create file.\n" << colorReset;
+        if (cmd == "init") {
+            initRepo();
+        } else if (cmd == "create-file") {
+            createFile();
+        } else if (cmd == "commit") {
+            cout << "Enter commit message: ";
+            string msg;
+            getline(cin, msg);
+            if (msg.empty()) {
+                cout << colorYellow << "Commit message cannot be empty.\n" << colorReset;
+                continue;
             }
-        }
-
-        else if (command == "switch") 
-        {
-            string branchName;
-            cout<<"Input Branch name in which you want to switch"<<endl;
-            cin >> branchName;
-            switchBranch(branchName);
-        } 
-        
-        else if (command == "merge") 
-        {
-            string sourceBranch;
-            cout<<"Input Branch name"<<endl;
-            cin >> sourceBranch;
-            detectConflicts(sourceBranch);
-            cout << "Proceed with merge? (yes/no): ";
-            string response;
-            cin >> response;
-
-            if (response == "yes") 
-            {
-                cout << colorYellow << "Merging branch...\n" << colorReset;
-                cout << colorGreen << "Branch merged successfully.\n" << colorReset;
-                logEvent("Merged '" + sourceBranch + "' into '" + currentBranch + "'");
-            } 
-            else 
-            {
-                cout << colorYellow << "Merge canceled.\n" << colorReset;
+            createCommit(msg);
+        } else if (cmd == "branch") {
+            string bname;
+            iss >> bname;
+            if (bname.empty()) {
+                cout << colorYellow << "Specify branch name.\n" << colorReset;
+                continue;
             }
-        }
-        
-        else if (command == "detect-conflicts") 
-        {
-            string sourceBranch;
-            cout<<"Input source branch"<<endl;
-            cin >> sourceBranch;
-            detectConflicts(sourceBranch);
-        } 
-        
-        else if (command == "cleanup") cleanupRepository();
-
-        else if (command == "help") displayHelp();
-
-        else if (command == "commit") 
-        {
-            string message;
-            getline(cin >> ws, message);
-            createCommit(message);
-        } 
-        else if (command == "push") pushToRemote();
-
-        else if (command == "pull") pullFromRemote();
-
-        else if (command == "log") viewLog();
-
-        else if (command == "diff") 
-        {
-            string filename;
-            cout<<"Input Filename"<<endl;
-            cin >> filename;
-            showDiff(filename);
-        } 
-
-        else if (command == "revert") 
-        {
-            string filename;
-            cout<<"Input Filename"<<endl;
-            cin >> filename;
-            revertFile(filename);
-        }
-
-        else if (command == "status") status();
-
-        else 
-        {
-            cout << colorRed << "Error: Unknown command '" << command << "'. Try 'help' for available commands.\n" << colorReset;
+            createBranch(bname);
+        } else if (cmd == "switch") {
+            string bname;
+            iss >> bname;
+            if (bname.empty()) {
+                cout << colorYellow << "Specify branch name.\n" << colorReset;
+                continue;
+            }
+            switchBranch(bname);
+        } else if (cmd == "log") {
+            viewLog();
+        } else if (cmd == "merge") {
+            string src;
+            iss >> src;
+            if (src.empty()) {
+                cout << colorYellow << "Specify source branch.\n" << colorReset;
+                continue;
+            }
+            mergeBranches(src);
+        } else if (cmd == "register") {
+            string user, pass;
+            cout << "Username: ";
+            getline(cin, user);
+            cout << "Password: ";
+            getline(cin, pass);
+            registerUser (user, pass);
+        } else if (cmd == "login") {
+            string user, pass;
+            cout << "Username: ";
+            getline(cin, user);
+            cout << "Password: ";
+            getline(cin, pass);
+            loginUser (user, pass);
+        } else if (cmd == "logout") {
+            logoutUser ();
+        } else if (cmd == "push") {
+            pushToRemote();
+        } else if (cmd == "pull") {
+            pullFromRemote();
+        } else if (cmd == "help") {
+            showHelp();
+        } else {
+            cout << colorRed << "Unknown command: " << cmd << "\n" << colorReset;
         }
     }
 
-    cout << colorGreen << "Exiting MiniGit++. Goodbye!\n" << colorReset;
+    cout << "Goodbye!\n";
     return 0;
 }
