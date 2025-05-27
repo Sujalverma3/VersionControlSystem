@@ -318,30 +318,6 @@ void logoutUser () {
     currentUser .clear();
 }
 
-void pushToRemote() {
-    if (currentUser .empty()) {
-        cout << colorRed << "You must be logged in to push.\n" << colorReset;
-        return;
-    }
-    remoteRepo = history;
-    cout << colorGreen << "Pushed commits to remote.\n" << colorReset;
-    logEvent("Pushed commits to remote by " + currentUser );
-}
-
-void pullFromRemote() {
-    if (currentUser .empty()) {
-        cout << colorRed << "You must be logged in to pull.\n" << colorReset;
-        return;
-    }
-    for (const auto &commit : remoteRepo) {
-        if (find_if(history.begin(), history.end(), [&](const Commit &c){ return c.id == commit.id; }) == history.end()) {
-            history.push_back(commit);
-        }
-    }
-    cout << colorGreen << "Pulled commits from remote.\n" << colorReset;
-    logEvent("Pulled commits from remote by " + currentUser );
-}
-
 void createFile() {
     string filename;
     cout << "Enter filename to create: ";
@@ -381,16 +357,14 @@ void showHelp() {
          << "  register             - Register new user\n"
          << "  login                - Login user\n"
          << "  logout               - Logout user\n"
-         << "  push                 - Push commits to remote\n"
-         << "  pull                 - Pull commits from remote\n"
          << "  help                 - Show this help\n"
          << "  exit                 - Exit program\n"
          << colorReset;
 }
 
 int main() {
-    cout << "MiniGit++ Version Control System\n";
-    cout << "Type 'help' for commands.\n";
+    cout << "                                       BIT BY GIT Version Control System\n";
+
 
     loadHashes();
 
@@ -459,12 +433,6 @@ int main() {
             cout << "Password: ";
             getline(cin, pass);
             loginUser (user, pass);
-        } else if (cmd == "logout") {
-            logoutUser ();
-        } else if (cmd == "push") {
-            pushToRemote();
-        } else if (cmd == "pull") {
-            pullFromRemote();
         } else if (cmd == "help") {
             showHelp();
         } else {
